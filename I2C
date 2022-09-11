@@ -1,0 +1,625 @@
+/* 
+ * File:   I2C HeartRate.c
+ * Author: Muzamil
+ *
+ * Created on April 10, 2022, 3:07 PM
+ */
+
+
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+//AVR pins that control 7 segment digits
+#define D2 0b11111101
+#define D3 0b11111011
+#define D4 0b11110111
+
+//7 Segment Numbers
+#define ZERO 0b01111110 // digit 0
+#define ONE 0b00001100 // digit 1
+#define TWO 0b10110110 // digit 2
+#define THREE 0b10011110 // digit 3
+#define FOUR 0b11001100 // digit 4
+#define FIVE 0b11011010 // digit 5
+#define SIX 0b11111010 // digit 6
+#define SEVEN 0b00001110 // digit 7
+#define EIGHT 0b11111110 // digit 8
+#define NINE 0b11011110 // digit 9
+
+//TWI Flags
+#define WRITE_FLAG_ON (TWI0.MSTATUS & (0x01 << 6)) //set to 1 when master  trasmit adress is completed
+#define READ_FLAG_ON (TWI0.MSTATUS & (0x01 << 7)) //set to 1 when master byte read is successful
+#define RECEIVE_NACK (TWI0.MSTATUS & (0x01 << 4)) //SLAVE ACK
+#define RECEIVE_ACK (TWI0.MSTATUS & (0x00 << 4)) //SLAVE NACK
+#define MASTER_ACK (TWI0.MCTRLB & (0x00 << 2)) //MASTER ACK
+#define FAILURE 0xFF
+
+//I2C Functions
+
+//This function initializes I2C communication.
+void init_twi(void);
+
+//This function sends a stop condition to the slave device (Heartbeat sensor).
+void send_stop(void);
+
+//This function clears the read, write and clock hold flags in the MSTATUS register.
+void clear_flags(void);
+
+//This function writes the address of the slave with a 'write' direction bit (0xAA for write) and
+//transmits it to the slave device to initialize the start condition. It returns
+//true if the slave responds with an acknowledge and false otherwise.
+bool twi_write_adress(void);
+
+//This function writes the address of the slave with a 'read' direction bit (0xAB for write) and
+//transmits it to the slave device to initialize the start condition. It returns
+//true if the slave responds with an acknowledge and false otherwise.
+bool twi_read_adress(void);
+
+//This function returns a variable with populated with data sent by the slave device.
+uint8_t twi_read_data(void);
+
+//This function initializes a specific I2C read command by writing a family, index, and write byte
+//to the slave device, then reading 2 bytes from the slave device as a response.
+//If the first byte returned is success (0x00), then the second byte is returned, otherwise
+//the first response byte is returned.
+uint8_t readByte(uint8_t Family_Byte,uint8_t Index_Byte, uint8_t Write_Byte);
+
+//This function initializes a specific I2C read command by writing a family and index byte
+//to the slave device, then reading 2 bytes from the slave device as a response.
+//If the first byte returned is success (0x00), then the second byte is returned, otherwise
+//the first response byte is returned.
+uint8_t read2Byte(uint8_t Family_Byte,uint8_t Index_Byte);
+
+//This function initializes a specific I2C read command by writing a family and index byte
+//to the slave device, then reading one byte from the slave device as a response.
+//The response byte is returned.
+uint8_t readByte2(uint8_t Family_Byte,uint8_t Index_Byte);
+
+//This function initializes a specific I2C read command by writing a family and index byte
+//to the slave device, then reading multiple bytes from the slave device as a response.
+//If the first byte is success (0x00), then an array of size ArraySize is filled with
+//multiple bytes from the slave device, otherwise, the array is populated with zeros.
+uint8_t readFillArray(uint8_t Family_Byte, uint8_t Index_Byte, uint8_t ArraySize, uint8_t Array[]);
+
+//This function initializes a specific I2C write command by writing a family, index byte, and write byte
+//to the slave device, then reading one byte from the slave device as a response.
+//The response byte is returned.
+uint8_t writeByte(uint8_t Family_Byte, uint8_t Index_Byte, uint8_t Write_Byte);
+
+//This function is the same as the previous one. A Longer delay (45 ms) is implemented to allow time
+// to enable certain functionalities of the slave device.
+uint8_t enableWrite(uint8_t Family_Byte, uint8_t Index_Byte, uint8_t Enable_Byte);
+
+//This function places the Heartbeat sensor on application mode.
+void application_mode(void);
+
+
+//7 Segment Display Functions
+
+int whichdigit(int index); 
+//This function selects the digit where information will be displayed
+
+void deselectdigit(int index); 
+//This function deselects the digit, common cathode display, so setting all the digits to HIGH de-selects them PORTC.OUT &= 0b00001111;
+
+void displaydigit(int number); 
+//This function displays a digit on the 7 segment.
+
+void cleardisplay();
+//This function clears the display.
+
+int digits(int number); 
+//This function returns the last digit of multi-digit number.
+
+int digit2segment(int digit); 
+// This function converts a digit to its 7 segment form.
+
+
+int main(void) {
+    
+    //CLK_PER settings
+    CCP = 0xd8;
+    CLKCTRL.MCLKCTRLA = 0b10000000; //enable CLKOUT to get CLK_PER & set internal oscillator as main CLK source
+    CLKCTRL.MCLKCTRLB = 0x00; //disable prescaler.
+    CLKCTRL.OSCHFCTRLA = 0b00011100;//set CLK frequency to 16MHz.
+    while( CLKCTRL.MCLKSTATUS & 0b00000001 ){
+        ;
+    }
+    //Setting MFIO and reset pins as outputs
+    PORTA.DIRSET = 0b00000011;
+    PORTC.DIRSET = 0b00000010;
+     
+    //TWI initialization (master and baud rate)
+    init_twi();
+    
+    //Place Heartbeat sensor on application mode
+    application_mode();
+    
+    uint8_t STATUS;
+    uint8_t sample_rate;
+    uint16_t HeartRate;
+    uint8_t sampAvail;
+    uint8_t HRStatus;
+    
+    //Command to check if Heartbeat sensor is on application mode.
+    STATUS = readByte2(0x02,0x00);
+    if (STATUS != 0x00) {
+        STATUS = readByte2(0x02,0x00);
+    }
+    
+    //Command to set the output mode of the sensor to algorithm data.
+    STATUS = writeByte(0x10,0x00,0x02);
+    if (STATUS != 0x00) {
+        STATUS = writeByte(0x10,0x00,0x02);
+    }
+    
+    //Command to limit the number of samples received from the sensor to one.
+    STATUS = writeByte(0x10,0x01,0x01);
+    if (STATUS != 0x00) {
+        STATUS = writeByte(0x10,0x01,0x01);
+    }
+    
+    //Command to enable the sensor's automatic gain control algorithm.
+    STATUS = enableWrite(0x52,0x00,0x01);
+    if (STATUS != 0x00) {
+        STATUS = enableWrite(0x52,0x00,0x01);
+    }
+    
+    //Command to enable the sensor.
+    STATUS = enableWrite(0x44,0x03,0x01);
+    if (STATUS != 0x00) {
+        STATUS = enableWrite(0x44,0x03,0x01);
+    }
+        
+    //Command to enable the sensor's fast algorithm mode.
+    STATUS = enableWrite(0x52,0x02,0x01);
+    if (STATUS != 0x00) {
+        STATUS = enableWrite(0x52,0x02,0x01);
+    }
+    
+    //Command to read the sampling rate of sensor.
+    sample_rate = readByte(0x51,0x00,0x03);
+    
+    _delay_ms(1000);
+    while (1) {
+        //Command to check status of samples
+        STATUS = readByte2(0x00,0x00);
+        if (STATUS == 1){
+            HeartRate = 0;
+        }
+        
+        //Command to read number of samples available in the sensor (should be 6)
+        sampAvail = read2Byte(0x12, 0x00);
+        
+        uint8_t bpmArr[6];
+        
+        //Fill array with data from the sensor.
+        readFillArray(0x12,0x01,0x06,bpmArr);
+        
+        //Heart rate data is located on the first and second response bytes. the
+        //MSB being in the first byte and the LSB on the second. HRStatus determines
+        //whether a finger was placed on the sensor or not. 0 If not finger has been detected.
+        HRStatus = bpmArr[5];
+        if (HRStatus == 0) {
+            HeartRate = 0;
+        }
+        HeartRate = ((uint16_t)bpmArr[0]) << 8;
+        HeartRate |= (bpmArr[1]);
+        HeartRate /= 10;
+        
+        
+        
+        //Displays heart rate on 7 segment.
+        for (int j = 0; j < 20; j++) {
+        int temp = HeartRate;    
+        for (int i = 2; i >= 0; i--) {
+            display = digit2segment(digits(temp));
+            temp = temp / 10;
+            digit_index = whichdigit(i);
+            shiftregdisplay(display, digit_index);
+        }
+        }
+        
+        //If Finger detected and heart rate is below or above average, set PA7 (which
+        //is connected to PD2 of second AVR) to high. When second AVR detects high on
+        //PD2, sound an alarm from the speaker and turn on red LED.
+        if (((HeartRate > 100) | (HeartRate < 60)) & (HRStatus != 0))
+            PORTA.OUT |= 0b10000000;
+        else
+            PORTA.OUT &= 0b01111111;
+    }    
+}
+
+
+
+void init_twi(void)
+{
+    //SDA Setup time is set to 8 clock cycles
+    //50 ns SDA hold time
+    TWI0.CTRLA = 0b00010100;
+    
+    //Set bus to idle
+    TWI0.MSTATUS = 0b00000001;
+    
+    //Clear Flags
+    TWI0.MSTATUS |= 0b11100000;
+    
+    //Set Baud Rate
+    TWI0.MBAUD = 19;
+    
+    //Enables I2C (TWI)
+    TWI0.MCTRLA = 0b00000001;
+}
+
+//Sends stop condition
+void send_stop(void) { 
+    TWI0.MCTRLB |= 0x03;
+}
+
+void clear_flags(void) {
+    TWI0.MSTATUS |= 0b11100000;
+}
+bool twi_write_adress(void)
+{
+	TWI0.MADDR = 0xAA; //address+write
+	while((TWI0.MSTATUS & 0x02) != 0x02); //wait until master becomes the Bus owner
+	
+	while(!WRITE_FLAG_ON); //wait for address to be read by slave device.
+	clear_flags();
+	if (RECEIVE_NACK) //if 'not acknowledge' is received, stop process.
+	{
+		send_stop(); //send stop
+		return false;
+	}
+	
+	return true;	
+}
+
+bool twi_read_adress(void)
+{
+	TWI0.MADDR = 0xAB; //address+read
+	while((TWI0.MSTATUS & 0x02) != 0x02); //wait for address to be read by slave device.
+	
+	if (RECEIVE_NACK) //if 'not acknowledge' is received, stop process.
+	{
+		send_stop(); //send stop
+		return false;
+	}
+	
+	return true;	
+}
+
+uint8_t twi_read_data(void)
+{
+    while(!READ_FLAG_ON);//wait for data to bread by the master.
+    unsigned char data = TWI0.MDATA;//read data received by the master.
+    clear_flags();
+    TWI0.MCTRLB |= 0b00000010;//send an acknowledge bit to the slave device
+    return data;
+}
+
+//read byte status byte
+uint8_t readByte(uint8_t Family_Byte,uint8_t Index_Byte, uint8_t Write_Byte){
+    uint8_t StatusByte;
+    uint8_t ReturnByte;
+    if (twi_write_adress()) {
+        TWI0.MDATA = Family_Byte ; //write family byte/higher address first
+        if (RECEIVE_NACK) {
+            send_stop();
+            return FAILURE;
+        }
+        clear_flags();
+        TWI0.MDATA = Index_Byte ; //if successful, send index byte
+        if (RECEIVE_NACK) {
+            send_stop();
+            return FAILURE;
+        }
+        clear_flags();
+        TWI0.MDATA = Write_Byte ; //if successful, send index byte
+        if (RECEIVE_NACK) {
+            send_stop();
+            return FAILURE;
+        }
+        clear_flags();
+        send_stop();
+        
+        //delay between write and read action
+        _delay_ms(6);
+        if (twi_read_adress()) {
+            while (!READ_FLAG_ON); //wait for data to be read by master
+            StatusByte = TWI0.MDATA; //read the data received by the master
+            clear_flags();
+            if (StatusByte) //if response byte is not success (0x00), return the response byte
+                return StatusByte;
+            TWI0.MCTRLB &= 0b11111011; //set acknowledge action to 'ACK'  
+            TWI0.MCTRLB |= 0b00000010; //send acknowledge bit to slave device.
+            while (!READ_FLAG_ON); //wait for data to be read by master
+            ReturnByte = TWI0.MDATA; //read the data received by the master
+            TWI0.MCTRLB |= 0b00000100; //set acknowledge action to 'NACK'
+            send_stop(); //send stop condition
+            return ReturnByte;
+        }
+    
+        return FAILURE;
+    }
+    return FAILURE;
+}
+
+uint8_t read2Byte(uint8_t Family_Byte,uint8_t Index_Byte){
+    uint8_t StatusByte;
+    uint8_t ReturnByte;
+    if (twi_write_adress()) {
+        TWI0.MDATA = Family_Byte ;//write family byte/higher address first
+        if (RECEIVE_NACK) {
+            send_stop();
+            return FAILURE;
+        }
+        clear_flags();
+        TWI0.MDATA = Index_Byte ;//if successful, send index byte
+        if (RECEIVE_NACK) {
+            send_stop();
+            return FAILURE;
+        }
+        clear_flags();
+        send_stop();
+        _delay_ms(6);
+        if (twi_read_adress()) {
+            while (!READ_FLAG_ON); //wait for data to be read by master
+            StatusByte = TWI0.MDATA; //read data received by the master
+            clear_flags();            
+            if (StatusByte) //if response byte is not success (0x00), return the response byte
+                return StatusByte;
+            TWI0.MCTRLB &= 0b11111011; //set acknowledge action to 'ACK'
+            TWI0.MCTRLB |= 0b00000010; //send acknowledge to slave device
+            while (!READ_FLAG_ON); //wait for data to be read by master
+            ReturnByte = TWI0.MDATA; //read data received by the master
+            TWI0.MCTRLB |= 0b00000100; //set acknowledge action to 'NACK'
+            send_stop(); //send stop condition
+            return ReturnByte;
+        }
+    
+        return FAILURE;
+    }
+    return FAILURE;
+}
+
+uint8_t readByte2(uint8_t Family_Byte,uint8_t Index_Byte){
+    uint8_t StatusByte;
+    uint8_t ReturnByte;
+    if (twi_write_adress()) {
+        TWI0.MDATA = Family_Byte ;//write family byte/higher address first
+        if (RECEIVE_NACK) {
+            send_stop();
+            return FAILURE;
+        }
+        clear_flags();
+        TWI0.MDATA = Index_Byte ;//if successful, send index byte
+        if (RECEIVE_NACK) {
+            send_stop();
+            return FAILURE;
+        }
+        clear_flags();
+        send_stop();
+        _delay_ms(6);
+        if (twi_read_adress()) {
+        //if (RECEIVE_ACK == 0x00){
+            while (!READ_FLAG_ON);
+            StatusByte = TWI0.MDATA; //
+            clear_flags();
+            if (StatusByte)
+                return StatusByte;
+            ReturnByte = StatusByte;
+            TWI0.MCTRLB |= 0b00000100;
+            send_stop();
+            return ReturnByte;
+        }
+    
+        return FAILURE;
+    }
+    return FAILURE;
+}
+
+uint8_t readFillArray(uint8_t Family_Byte, uint8_t Index_Byte, uint8_t ArraySize, uint8_t Array[]) {
+    uint8_t StatusByte;
+    if (twi_write_adress()) {
+        TWI0.MDATA = Family_Byte ;//write family byte/higher address first
+        if (RECEIVE_NACK) {
+            send_stop();
+            return FAILURE;
+        }
+        clear_flags();
+        TWI0.MDATA = Index_Byte ;//if successful, send index byte
+        if (RECEIVE_NACK) {
+            send_stop();
+            return FAILURE;
+        }
+        clear_flags();
+        _delay_ms(6);
+        if (twi_read_adress()) {
+        //if (RECEIVE_ACK == 0x00){
+            while (!READ_FLAG_ON);
+            StatusByte = TWI0.MDATA; //
+            clear_flags();
+            if (StatusByte) {
+                for(uint8_t i = 0; i < ArraySize; i++) {
+                    Array[i] = 0;
+                }
+                return Array;
+            }
+            
+            for(uint8_t i = 0; i < ArraySize; i++) {
+                TWI0.MCTRLB &= 0b11111011;
+                TWI0.MCTRLB |= 0b00000010;
+                Array[i] = twi_read_data();
+            }
+            TWI0.MCTRLB |= 0b00000100;
+            send_stop();
+            return Array;
+        }
+        return FAILURE;
+    }
+}
+
+uint8_t writeByte(uint8_t Family_Byte, uint8_t Index_Byte, uint8_t Write_Byte) {
+    twi_write_adress();
+    uint8_t StatusByte;
+    TWI0.MDATA = Family_Byte;
+    if (RECEIVE_NACK) {
+        send_stop();
+        return FAILURE;
+    }
+    clear_flags();
+    TWI0.MDATA = Index_Byte;
+    if (RECEIVE_NACK) {
+        send_stop();
+        return FAILURE;
+    }
+    clear_flags();
+    TWI0.MDATA = Write_Byte;
+    if (RECEIVE_NACK) {
+        send_stop();
+        return FAILURE;
+    }
+    clear_flags();
+    send_stop();
+    _delay_ms(6);
+    if (twi_read_adress()) {
+        while (!READ_FLAG_ON);
+        StatusByte = TWI0.MDATA;
+        clear_flags();
+        send_stop();
+        return StatusByte;
+    }
+}
+
+uint8_t enableWrite(uint8_t Family_Byte, uint8_t Index_Byte, uint8_t Enable_Byte) {
+    twi_write_adress();
+    uint8_t StatusByte;
+    TWI0.MDATA = Family_Byte;
+    if (RECEIVE_NACK) {
+        send_stop();
+        return FAILURE;
+    }
+    TWI0.MSTATUS |= 0b01000000;
+    TWI0.MDATA = Index_Byte;
+    if (RECEIVE_NACK) {
+        send_stop();
+        return FAILURE;
+    }
+    TWI0.MSTATUS |= 0b01000000;
+    TWI0.MDATA = Enable_Byte;
+    if (RECEIVE_NACK) {
+        send_stop();
+        return FAILURE;
+    }
+    TWI0.MSTATUS |= 0b01000000;
+    send_stop();
+    _delay_ms(45);
+    if (twi_read_adress()) {
+        while (!READ_FLAG_ON);
+        StatusByte = TWI0.MDATA;
+        clear_flags();
+        send_stop();
+        return StatusByte;
+    }
+}
+    
+void application_mode(void){
+    //PA0 is RSTN and PA1 is MFIO
+    PORTA.OUTCLR = 0b00000001;
+    PORTA.OUTSET = 0b00000010;
+    _delay_ms(10);
+    PORTA.OUTSET = 0b00000001;
+    _delay_ms(1000);
+}
+
+int whichdigit(int index) 
+{
+    if(index == 0)
+        return D2;
+    else if(index == 1)
+        return D3;
+    else if(index == 2)
+        return D4;
+}
+
+void deselectdigit(int index) {
+    if(index == 0)
+        PORTC.OUT &= !D2;
+    else if(index == 1)
+        PORTC.OUT &= !D3;
+    else if(index == 2)
+        PORTC.OUT &= !D4;
+}
+
+void cleardisplay(){
+    PORTC.OUT = 0b00000000;
+}
+
+int digits(int number){
+    int arr; // To store the digit of the number
+    arr = number % 10;
+    return arr;    
+}
+
+void shiftregdisplay(int digit_bits, int digit_index) {
+    PORTC.OUT |= digit_index;
+    int sreg = 0b10000000;
+    for (int i = 0; i < 8; i++) {
+        if (digit_bits & sreg) {
+            PORTA.OUT |= 0b01000000;
+            PORTA.OUT |= 0b00010000;
+            PORTA.OUT &= 0b10111111;
+            PORTA.OUT &= 0b11101111;
+            digit_bits = digit_bits << 1;        
+        }
+        else {
+            PORTA.OUT |= 0b00010000;
+            PORTA.OUT &= 0b11101111;
+            digit_bits = digit_bits << 1;
+        }
+    }
+    PORTA.OUT |= 0b00100000;
+    PORTA.OUT &= 0b11011111;
+    _delay_ms(5);
+    cleardisplay();
+}
+
+int digit2segment(int digit){
+    switch(digit){
+        case 0:
+            return ZERO;
+        break;
+        case 1: 
+            return ONE;
+        break;
+        case 2: 
+            return TWO;
+        break;
+        case 3: 
+            return THREE;
+        break;
+        case 4: 
+            return FOUR;
+        break;
+        case 5: 
+            return FIVE;
+        break;
+        case 6: 
+            return SIX;
+        break;
+        case 7: 
+            return SEVEN;
+        break;
+        case 8: 
+            return EIGHT;
+        break;
+        case 9: 
+            return NINE; 
+        break;
+    }
+}
